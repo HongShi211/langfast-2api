@@ -11,9 +11,6 @@
 
 > "我们站在巨人的肩膀上，是为了看得更远，而不是为了成为巨人脚下的阴影。这个项目，就是让你把任何强大的 AI 服务，都变成你自己的'巨人'。"
 
-[![快速开始](https://img.shields.io/badge/快速开始-部署指南-brightgreen?style=for-the-badge)](##-一键部署指南)
-[![在线演示](https://img.shields.io/badge/在线演示-立即体验-orange?style=for-the-badge)](##-使用示例)
-
 </div>
 
 ## 📖 目录
