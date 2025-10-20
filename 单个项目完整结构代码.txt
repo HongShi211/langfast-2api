@@ -1,0 +1,749 @@
+项目 'langfast-2api' 的结构树:
+📂 langfast-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 langfast_provider.py
+        📂 services/
+            📄 credential_manager.py
+            📄 socketio_manager.py
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# ====================================================================
+# langfast-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+# --- 凭证池配置 (可选) ---
+# 凭证池中维护的最小匿名账号数量
+MIN_CREDENTIALS=5
+# 凭证池中维护的最大匿名账号数量
+MAX_CREDENTIALS=10
+
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# langfast-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-langfast-2api-default-key-please-change-me
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+# --- 凭证池配置 (可选) ---
+# 凭证池中维护的最小匿名账号数量
+MIN_CREDENTIALS=5
+# 凭证池中维护的最大匿名账号数量
+MAX_CREDENTIALS=10
+
+
+
+--- 文件路径: Dockerfile ---
+
+# /Dockerfile
+FROM python:3.10-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+# /docker-compose.yml
+services:
+  nginx:
+    image: nginx:latest
+    container_name: langfast-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - langfast-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: langfast-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - langfast-net
+
+networks:
+  langfast-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+import sys
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.langfast_provider import LangfastProvider
+
+# --- 配置 Loguru ---
+logger.remove()
+logger.add(
+    sys.stdout,
+    level="INFO",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+           "<level>{level: <8}</level> | "
+           "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    colorize=True
+)
+
+provider: Optional[LangfastProvider] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global provider
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    provider = LangfastProvider()
+    await provider.initialize()
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    yield
+    await provider.close()
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request):
+    try:
+        request_data = await request.json()
+        return await provider.chat_completion(request_data)
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)])
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", summary="根路径", include_in_schema=False)
+def root():
+    return {"message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}. 服务运行正常。"}
+
+
+--- 文件路径: nginx.conf ---
+
+# /nginx.conf
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream langfast_backend {
+        # ip_hash 确保来自同一客户端的请求被转发到同一个 worker,
+        # 这对于保持会话上下文的连续性至关重要。
+        ip_hash;
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://langfast_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # 流式传输优化
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+loguru
+httpx
+python-socketio[asyncio_client]
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+import os
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Optional, Dict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "langfast-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 langfa.st 转换为兼容 OpenAI 格式 API 的高性能代理。"
+
+    # --- 安全与部署 ---
+    API_MASTER_KEY: Optional[str] = "1"
+    NGINX_PORT: int = 8088
+
+    # --- 上游 API ---
+    SUPABASE_URL: str = "https://yzaaxwkjukajpwqflndu.supabase.co"
+    SUPABASE_ANON_KEY: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl6YWF4d2tqdWthanB3cWZsbmR1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDMxNTgzNzUsImV4cCI6MjA1ODczNDM3NX0.tDu7BsFUOV4aPo8U-dsokQJSRw29LQWT8JfDqQe5MoI"
+    SOCKET_URL: str = "wss://langfast-prompt-runner-35808038077.us-central1.run.app"
+    
+    # --- 凭证池配置 ---
+    MIN_CREDENTIALS: int = 5
+    MAX_CREDENTIALS: int = 10
+
+    # --- 模型列表 ---
+    KNOWN_MODELS: List[str] = [
+        "gpt-5", "gpt-5-mini", "gpt-5-nano",
+        "gpt-4.5-preview", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
+        "gpt-4o", "gpt-4o-mini", "o1", "o1-mini", "o3", "o3-mini", "o4-mini",
+        "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"
+    ]
+    DEFAULT_MODEL: str = "gpt-4o-mini"
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(
+        self,
+        request_data: Dict[str, Any]
+    ) -> StreamingResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\langfast_provider.py ---
+
+import httpx
+import json
+import uuid
+import time
+import asyncio
+import base64
+from typing import Dict, Any, AsyncGenerator, Optional
+
+from fastapi.responses import StreamingResponse, JSONResponse
+from loguru import logger
+
+from app.core.config import settings
+from app.services.credential_manager import CredentialManager
+from app.services.socketio_manager import SocketIOManager
+from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK, create_chat_completion_response
+
+# 日志记录辅助函数 (无变动)
+async def log_request(request):
+    logger.debug(f"--- [HTTP Request] --->")
+    logger.debug(f"Request: {request.method} {request.url}")
+    logger.debug(f"Headers: {request.headers}")
+    if request.content:
+        try:
+            content = json.loads(request.content)
+            logger.debug(f"Body: \n{json.dumps(content, indent=2, ensure_ascii=False)}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.debug(f"Body (raw): {request.content}")
+    logger.debug(f"--- [HTTP Request] ---")
+
+async def log_response(response):
+    await response.aread()
+    logger.debug(f"<--- [HTTP Response] ---")
+    logger.debug(f"Status: {response.status_code}")
+    logger.debug(f"Headers: {response.headers}")
+    try:
+        content = response.json()
+        logger.debug(f"Body: \n{json.dumps(content, indent=2, ensure_ascii=False)}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.debug(f"Body (raw): {response.text}")
+    logger.debug(f"<--- [HTTP Response] ---")
+
+# JWT 解码辅助函数 (无变动)
+def get_user_id_from_token(token: str) -> Optional[str]:
+    if not token: return None
+    try:
+        parts = token.split('.')
+        if len(parts) != 3: return None
+        payload_b64 = parts[1]
+        payload_b64 += '=' * (-len(payload_b64) % 4)
+        payload_json = base64.b64decode(payload_b64).decode('utf-8')
+        payload = json.loads(payload_json)
+        return payload.get('sub')
+    except Exception as e:
+        logger.error(f"从 token 解码用户 ID 时发生错误: {e}", exc_info=True)
+        return None
+
+class LangfastProvider:
+    def __init__(self):
+        self.credential_manager = CredentialManager()
+        self.initiate_url = f"{settings.SUPABASE_URL}/functions/v1/initiate-prompt-run"
+        self.client = httpx.AsyncClient(
+            timeout=30.0,
+            event_hooks={'request': [log_request], 'response': [log_response]}
+        )
+
+    async def initialize(self):
+        await self.credential_manager.initialize()
+
+    async def close(self):
+        await self.credential_manager.close()
+        await self.client.aclose()
+
+    # --- [修改] 重构 chat_completion 以支持流式和非流式 ---
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse | JSONResponse:
+        is_streaming = request_data.get("stream", False)
+        request_id = f"chatcmpl-{uuid.uuid4()}"
+        model = request_data.get("model", settings.DEFAULT_MODEL)
+
+        try:
+            access_token = await self.credential_manager.get_credential()
+            user_id = get_user_id_from_token(access_token)
+            if not user_id:
+                raise Exception("无法从凭证中解析用户ID，请求中断。")
+
+            socket_manager = SocketIOManager(access_token, settings.SOCKET_URL)
+            await socket_manager.connect()
+
+            headers = {
+                "apikey": settings.SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            payload = self._prepare_payload(request_data, user_id)
+
+            logger.info(f"正在向上游发送聊天触发请求 (stream={is_streaming})...")
+            response = await self.client.post(self.initiate_url, headers=headers, json=payload)
+            response.raise_for_status()
+            logger.success("聊天触发请求成功。等待 Socket.IO 数据...")
+
+            if is_streaming:
+                return StreamingResponse(
+                    self._stream_generator(request_id, model, socket_manager),
+                    media_type="text/event-stream"
+                )
+            else:
+                final_data = await self._collect_full_response(socket_manager)
+                await socket_manager.disconnect()
+                response_json = create_chat_completion_response(
+                    request_id,
+                    model,
+                    final_data.get("content", ""),
+                    final_data.get("finish_reason", "stop")
+                )
+                return JSONResponse(content=response_json)
+
+        except Exception as e:
+            logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+            if is_streaming:
+                async def error_stream():
+                    chunk = create_chat_completion_chunk(request_id, model, f"内部服务器错误: {e}", "stop")
+                    yield create_sse_data(chunk)
+                    yield DONE_CHUNK
+                return StreamingResponse(error_stream(), media_type="text/event-stream")
+            else:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": {"message": f"内部服务器错误: {e}", "type": "server_error"}}
+                )
+
+    # --- [修改] 实现增量计算的流式生成器 ---
+    async def _stream_generator(self, request_id: str, model: str, socket_manager: SocketIOManager) -> AsyncGenerator[str, None]:
+        last_content = ""
+        try:
+            while not socket_manager.is_finished.is_set():
+                data = await socket_manager.get_data()
+                if data is None:
+                    break
+
+                full_content = data.get("content", "")
+                if full_content and full_content != last_content:
+                    # 计算增量
+                    delta_content = full_content[len(last_content):]
+                    chunk = create_chat_completion_chunk(request_id, model, delta_content)
+                    yield create_sse_data(chunk)
+                    last_content = full_content
+        
+        except Exception as e:
+            logger.error(f"处理流时发生严重错误: {e}", exc_info=True)
+            error_chunk = create_chat_completion_chunk(request_id, model, f"内部服务器错误: {e}", "stop")
+            yield create_sse_data(error_chunk)
+        finally:
+            final_chunk = create_chat_completion_chunk(request_id, model, "", "stop")
+            yield create_sse_data(final_chunk)
+            yield DONE_CHUNK
+            await socket_manager.disconnect()
+
+    # --- [新增] 用于非流式响应的函数 ---
+    async def _collect_full_response(self, socket_manager: SocketIOManager) -> Dict[str, Any]:
+        final_data = {}
+        while not socket_manager.is_finished.is_set():
+            data = await socket_manager.get_data()
+            if data is None:
+                break
+            final_data = data # 不断覆盖，直到最后一个
+        return final_data
+
+    def _prepare_payload(self, request_data: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+        prompt_meta = {
+            "model": request_data.get("model", settings.DEFAULT_MODEL),
+            "messages": request_data.get("messages", []),
+            "temperature": request_data.get("temperature", 0.7),
+            "top_p": request_data.get("top_p", 1),
+            "frequency_penalty": request_data.get("frequency_penalty", 0),
+            "presence_penalty": request_data.get("presence_penalty", 0),
+            "max_completion_tokens": request_data.get("max_tokens", 16384),
+            "response_format": "text",
+            "stream": True, # 上游始终使用流式，由我们决定如何返回给客户端
+        }
+        return {
+            "run_id": str(uuid.uuid4()),
+            "prompt_id": "6456df9f-f4fd-42b3-97ff-df29af7188b7",
+            "prompt_meta": prompt_meta,
+            "test_cases": [],
+            "created_by": user_id
+        }
+
+    async def get_models(self) -> JSONResponse:
+        return JSONResponse(content={
+            "object": "list",
+            "data": [{"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"} for name in settings.KNOWN_MODELS]
+        })
+
+
+--- 文件路径: app\services\credential_manager.py ---
+
+import asyncio
+import httpx
+from collections import deque
+from typing import Optional
+from loguru import logger
+from app.core.config import settings
+
+class CredentialManager:
+    def __init__(self):
+        self.credentials = deque()
+        self.lock = asyncio.Lock()
+        self.signup_url = f"{settings.SUPABASE_URL}/auth/v1/signup"
+        self.headers = {
+            "apikey": settings.SUPABASE_ANON_KEY,
+            "Content-Type": "application/json"
+        }
+        # 修正：为 httpx 客户端设置超时
+        self.client = httpx.AsyncClient(timeout=30.0)
+
+    async def initialize(self):
+        logger.info("正在初始化凭证管理器...")
+        await self.maintain_credentials()
+
+    async def _create_new_credential(self) -> Optional[str]:
+        try:
+            logger.info("正在注册新的匿名账号...")
+            # 修正：匿名注册的 body 是一个空 json
+            response = await self.client.post(self.signup_url, headers=self.headers, json={})
+            response.raise_for_status()
+            data = response.json()
+            access_token = data.get("access_token")
+            if access_token:
+                logger.success("成功获取新的匿名凭证。")
+                return access_token
+            else:
+                logger.error(f"注册匿名账号失败，响应中缺少 'access_token': {data}")
+                return None
+        except httpx.RequestError as e:
+            # 修正：捕获并记录更具体的网络错误
+            logger.error(f"注册匿名账号时发生网络请求错误: {type(e).__name__} - {e}")
+            return None
+        except Exception as e:
+            logger.error(f"注册匿名账号时发生未知错误: {e}", exc_info=True)
+            return None
+
+    async def maintain_credentials(self):
+        async with self.lock:
+            while len(self.credentials) < settings.MIN_CREDENTIALS:
+                if len(self.credentials) >= settings.MAX_CREDENTIALS:
+                    logger.info(f"凭证池已满 ({len(self.credentials)}个)，停止补充。")
+                    break
+              
+                new_token = await self._create_new_credential()
+                if new_token:
+                    self.credentials.append(new_token)
+                else:
+                    logger.warning("无法创建新凭证，将在下次维护时重试。")
+                    break
+
+    async def get_credential(self) -> str:
+        async with self.lock:
+            if not self.credentials:
+                logger.warning("凭证池为空，正在紧急补充...")
+                await self.maintain_credentials()
+                if not self.credentials:
+                    raise Exception("无法获取任何有效凭证。")
+          
+            token = self.credentials.popleft()
+            asyncio.create_task(self.maintain_credentials())
+            logger.info(f"提供一个凭证，池中剩余: {len(self.credentials)}")
+            return token
+
+    async def close(self):
+        await self.client.aclose()
+
+
+--- 文件路径: app\services\socketio_manager.py ---
+
+import asyncio
+import socketio
+import json
+from loguru import logger
+
+class SocketIOManager:
+    def __init__(self, access_token: str, socket_url: str):
+        self.sio = socketio.AsyncClient(logger=False, engineio_logger=False)
+        self.access_token = access_token
+        self.socket_url = socket_url
+        self.queue = asyncio.Queue()
+        self.is_connected = asyncio.Event()
+        self.is_finished = asyncio.Event()
+
+        self._setup_event_handlers()
+
+    def _setup_event_handlers(self):
+        @self.sio.event
+        async def connect():
+            logger.success("Socket.IO 连接成功。")
+            self.is_connected.set()
+
+        @self.sio.event
+        async def disconnect():
+            logger.warning("Socket.IO 连接断开。")
+            self.is_connected.clear()
+            if not self.is_finished.is_set():
+                await self.queue.put(None)
+                self.is_finished.set()
+
+        # --- [修改] 监听正确的事件名称 'execution:chunk' ---
+        @self.sio.on('execution:chunk')
+        async def on_execution_chunk(data):
+            logger.debug(f"收到 'execution:chunk' 事件，内容: {data}")
+            processed_data = data
+            if isinstance(data, str):
+                try:
+                    processed_data = json.loads(data)
+                except json.JSONDecodeError:
+                    logger.warning(f"收到的字符串不是有效的JSON，将作为普通文本处理: {data}")
+                    processed_data = {"content": data}
+          
+            if not isinstance(processed_data, dict):
+                 logger.warning(f"处理后的数据仍然不是字典。类型: {type(processed_data)}")
+                 processed_data = {"content": str(processed_data)}
+
+            await self.queue.put(processed_data)
+            
+            # --- [新增] 检查完成状态 ---
+            if processed_data.get('status') == 'completed':
+                logger.info("Socket.IO 收到 'completed' 状态，标记为完成。")
+                if not self.is_finished.is_set():
+                    await self.queue.put(None)
+                    self.is_finished.set()
+
+        @self.sio.on('completion_finished')
+        async def on_completion_finished(data):
+            logger.info(f"Socket.IO 收到 'completion_finished' 事件。数据: {data}")
+            if not self.is_finished.is_set():
+                await self.queue.put(None)
+                self.is_finished.set()
+      
+        @self.sio.on('*')
+        async def catch_all(event, data):
+            # --- [修改] 调整未知事件的日志，避免 'execution:chunk' 被重复记录 ---
+            if event not in ['execution:chunk', 'completion_finished']:
+                logger.info(f"捕获到未知 Socket.IO 事件: '{event}', 数据: {data}")
+
+    async def connect(self):
+        try:
+            await self.sio.connect(
+                self.socket_url,
+                auth={'token': self.access_token},
+                transports=['websocket'],
+                wait_timeout=20
+            )
+            await self.is_connected.wait()
+        except Exception as e:
+            logger.error(f"Socket.IO 连接失败: {e}", exc_info=True)
+            self.is_finished.set()
+            raise
+
+    async def disconnect(self):
+        if self.sio.connected:
+            await self.sio.disconnect()
+
+    async def get_data(self):
+        return await self.queue.get()
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+def create_sse_data(data: Dict[str, Any]) -> str:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的聊天补全流式块。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+# --- [新增] 创建与 OpenAI 兼容的非流式聊天补全响应 ---
+def create_chat_completion_response(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: str
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的完整、非流式聊天补全响应。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                },
+                "finish_reason": finish_reason
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0, # 注意：目前无法从上游获取准确的 token 数
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+    }
+
+DONE_CHUNK = create_sse_data({"id": "done", "object": "done", "choices": [], "created": int(time.time()), "model": "done"})
+
+
+
