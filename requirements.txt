@@ -5,3 +5,4 @@ python-dotenv
 loguru
 httpx
 python-socketio[asyncio_client]
+aiohttp
