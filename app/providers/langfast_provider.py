@@ -90,6 +90,7 @@ class LangfastProvider:
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json"
             }
+            # 【关键修改】在准备 payload 时过滤不支持的参数
             payload = self._prepare_payload(request_data, user_id)
 
             logger.info(f"正在向上游发送聊天触发请求 (stream={is_streaming})...")
@@ -164,18 +165,38 @@ class LangfastProvider:
             final_data = data # 不断覆盖，直到最后一个
         return final_data
 
+    # --- [关键修改] 修改 _prepare_payload 方法以过滤不支持的参数 ---
     def _prepare_payload(self, request_data: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+        # 定义上游不支持的参数列表
+        # 根据错误日志 "Unsupported parameter: 'temperature' is not supported with this model."
+        # 我们将这些参数从发送给上游的请求中移除
+        unsupported_params = {
+            'temperature', 'top_p', 'frequency_penalty', 'presence_penalty', 'max_tokens'
+        }
+        
+        # 过滤 prompt_meta 中的参数
         prompt_meta = {
             "model": request_data.get("model", settings.DEFAULT_MODEL),
             "messages": request_data.get("messages", []),
-            "temperature": request_data.get("temperature", 0.7),
-            "top_p": request_data.get("top_p", 1),
-            "frequency_penalty": request_data.get("frequency_penalty", 0),
-            "presence_penalty": request_data.get("presence_penalty", 0),
-            "max_completion_tokens": request_data.get("max_tokens", 16384),
+            # 移除不支持的参数，但保留默认值以防内部逻辑需要
+            # "temperature": request_data.get("temperature", 0.7),
+            # "top_p": request_data.get("top_p", 1),
+            # "frequency_penalty": request_data.get("frequency_penalty", 0),
+            # "presence_penalty": request_data.get("presence_penalty", 0),
+            # "max_completion_tokens": request_data.get("max_tokens", 16384),
             "response_format": "text",
             "stream": True, # 上游始终使用流式，由我们决定如何返回给客户端
         }
+        
+        # 记录被过滤的参数，方便调试
+        filtered_params = []
+        for param in unsupported_params:
+            if param in request_data:
+                filtered_params.append(param)
+        
+        if filtered_params:
+            logger.info(f"已过滤掉上游不支持的参数: {', '.join(filtered_params)}")
+        
         return {
             "run_id": str(uuid.uuid4()),
             "prompt_id": "6456df9f-f4fd-42b3-97ff-df29af7188b7",
